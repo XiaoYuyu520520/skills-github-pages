@@ -1,0 +1,109 @@
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import Twist
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
+
+class LineFollowingObstacleAvoidance(Node):
+    def __init__(self):
+        super().__init__('line_following_obstacle_avoidance')
+        self.get_logger().info("启动循迹与避障节点...")
+
+        # 初始化发布者和订阅者
+        self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.camera_sub = self.create_subscription(Image, 'camera/image', self.camera_callback, qos_profile_sensor_data)
+
+        # 初始化参数
+        self.line_color_threshold = 50  # 黑线颜色阈值
+        self.obstacle_threshold = 100  # 障碍物检测阈值（像素）
+        self.pid = PIDController(kp=0.01, ki=0.001, kd=0.005)  # PID 控制器参数
+        self.error_prev = 0
+        self.error_sum = 0
+        self.cv_bridge = CvBridge()
+
+        # 初始化速度消息
+        self.twist = Twist()
+        self.twist.linear.x = 0.2  # 前进速度
+
+    def camera_callback(self, msg):
+        """相机回调函数，用于循迹和避障"""
+        try:
+            # 将 ROS 图像消息转换为 OpenCV 图像
+            cv_image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            self.follow_line(cv_image)
+            self.obstacle_avoidance(cv_image)
+        except Exception as e:
+            self.get_logger().error(f"图像处理错误：{e}")
+
+    def follow_line(self, image):
+        """循迹算法"""
+        # 转换为灰度图像
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, self.line_color_threshold, 255, cv2.THRESH_BINARY_INV)
+
+        # 查找黑线的中心点
+        height, width = binary.shape
+        roi = binary[int(height * 0.75):, :]  # 只关注图像下半部分
+        moments = cv2.moments(roi)
+
+        if moments['m00'] > 0:
+            cx = int(moments['m10'] / moments['m00'])
+            error = cx - width // 2
+            self.twist.angular.z = self.pid.update(error, self.error_prev, self.error_sum)
+            self.error_prev = error
+            self.error_sum += error
+        else:
+            self.twist.angular.z = 0.0
+
+        self.cmd_vel_pub.publish(self.twist)
+
+    def obstacle_avoidance(self, image):
+        """避障算法"""
+        # 使用深度学习或传统方法检测障碍物
+        # 这里简化为检测图像前方是否有大面积白色区域（假设障碍物为白色）
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY)
+
+        # 检测前方区域
+        roi = binary[:int(binary.shape[0] * 0.5), :]
+        white_area = cv2.countNonZero(roi)
+
+        if white_area > self.obstacle_threshold:
+            self.twist.linear.x = 0.0  # 停止前进
+            self.twist.angular.z = 0.5  # 转向避障
+        else:
+            self.twist.linear.x = 0.2  # 恢复前进
+
+        self.cmd_vel_pub.publish(self.twist)
+
+
+class PIDController:
+    """PID 控制器类"""
+    def __init__(self, kp, ki, kd):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+
+    def update(self, error, error_prev, error_sum):
+        """更新 PID 控制器"""
+        output = self.kp * error + self.ki * error_sum + self.kd * (error - error_prev)
+        return output
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LineFollowingObstacleAvoidance()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("程序被用户中断")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
